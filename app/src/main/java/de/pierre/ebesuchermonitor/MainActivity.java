@@ -23,11 +23,13 @@ import java.text.DateFormat;
 import java.text.NumberFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -39,6 +41,7 @@ public final class MainActivity extends Activity {
     private static final String PREF_AUTO = "auto_refresh";
     private static final String PREF_LAST_SUCCESS = "last_success";
 
+    private static final TimeZone BERLIN = TimeZone.getTimeZone("Europe/Berlin");
     private static final long REFRESH_INTERVAL_MS = 120_000L;
     private static final double BTP_EPSILON = 0.005;
 
@@ -47,7 +50,8 @@ public final class MainActivity extends Activity {
     private final TextView[] surfName = new TextView[2];
     private final TextView[] surfStatus = new TextView[2];
     private final TextView[] surfToday = new TextView[2];
-    private final TextView[] surfTenMinutes = new TextView[2];
+    private final TextView[] surfCurrentHour = new TextView[2];
+    private final TextView[] surfPreviousHour = new TextView[2];
     private final TextView[] surfLast = new TextView[2];
 
     private EditText usernameInput;
@@ -56,6 +60,7 @@ public final class MainActivity extends Activity {
     private Button refreshButton;
     private TextView connectionStatus;
     private TextView totalToday;
+    private TextView summaryHint;
     private TextView rateLimit;
     private TextView updatedAt;
 
@@ -136,11 +141,10 @@ public final class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        TextView title = text("eBesucher Monitor", 28, true, Color.rgb(17, 24, 39));
-        root.addView(title);
+        root.addView(text("eBesucher Monitor", 28, true, Color.rgb(17, 24, 39)));
 
-        TextView subtitle = text("Version 0.1.3 · 10-Minuten-BTP-Monitor", 14, false,
-                Color.rgb(75, 85, 99));
+        TextView subtitle = text("Version 0.1.4 · Stundenstatistik ohne falsche Offline-Warnung",
+                14, false, Color.rgb(75, 85, 99));
         subtitle.setPadding(0, dp(3), 0, dp(14));
         root.addView(subtitle);
 
@@ -195,8 +199,12 @@ public final class MainActivity extends Activity {
         LinearLayout summary = card();
         root.addView(summary, spacedParams());
         summary.addView(text("Übersicht", 19, true, Color.rgb(17, 24, 39)));
-        totalToday = text("Heute gesamt: –", 22, true, Color.rgb(37, 99, 235));
+        totalToday = text("Heute laut API: –", 22, true, Color.rgb(37, 99, 235));
         summary.addView(totalToday, topMargin(8));
+        summaryHint = text(
+                "Die laufende Stunde kann in der API zeitversetzt oder noch unvollständig sein.",
+                12, false, Color.rgb(180, 83, 9));
+        summary.addView(summaryHint, topMargin(4));
         updatedAt = text("Letzte erfolgreiche Aktualisierung: –", 13, false,
                 Color.rgb(75, 85, 99));
         summary.addView(updatedAt, topMargin(5));
@@ -207,9 +215,10 @@ public final class MainActivity extends Activity {
         root.addView(buildSurfbarCard(1), spacedParams());
 
         TextView note = text(
-                "Statuslogik v0.1.3: Grün bedeutet, dass eBesucher in den letzten 10 Minuten "
-                        + "BTP für diesen Surflink gemeldet hat. Orange bedeutet nur: derzeit keine "
-                        + "BTP-Gutschrift. Daraus folgt nicht automatisch, dass der Browser gestoppt ist. "
+                "Statuslogik v0.1.4: Die offizielle API liefert Stundenwerte 1–24. "
+                        + "Ein positiver Wert für die laufende Stunde bestätigt BTP-Verdienst. "
+                        + "Ein fehlender oder 0-BTP-Wert wird nicht mehr als Stillstand gewertet, "
+                        + "weil Webseite/CSV der API bei der laufenden Stunde voraus sein können. "
                         + "lastActivity bleibt reine Zusatzinformation.",
                 12, false, Color.rgb(75, 85, 99));
         note.setPadding(dp(4), dp(2), dp(4), 0);
@@ -229,12 +238,16 @@ public final class MainActivity extends Activity {
                 Color.rgb(107, 114, 128));
         card.addView(surfStatus[index], topMargin(8));
 
-        surfToday[index] = text("Heute: –", 18, true, Color.rgb(17, 24, 39));
+        surfToday[index] = text("Heute laut API: –", 18, true, Color.rgb(17, 24, 39));
         card.addView(surfToday[index], topMargin(10));
 
-        surfTenMinutes[index] = text("Letzte 10 Minuten: –", 14, true,
+        surfCurrentHour[index] = text("Aktuelle Stunde: –", 14, true,
                 Color.rgb(75, 85, 99));
-        card.addView(surfTenMinutes[index], topMargin(4));
+        card.addView(surfCurrentHour[index], topMargin(4));
+
+        surfPreviousHour[index] = text("Vorherige Stunde: –", 14, false,
+                Color.rgb(55, 65, 81));
+        card.addView(surfPreviousHour[index], topMargin(4));
 
         surfLast[index] = text("API lastActivity: –", 12, false, Color.rgb(107, 114, 128));
         card.addView(surfLast[index], topMargin(5));
@@ -288,16 +301,36 @@ public final class MainActivity extends Activity {
 
                 int count = Math.min(2, links.size());
                 String today = berlinDate();
-                long nowUnix = System.currentTimeMillis() / 1000L;
-                long tenMinutesAgoUnix = nowUnix - 600L;
+                Calendar calendar = Calendar.getInstance(BERLIN, Locale.GERMANY);
+                int clockHour = calendar.get(Calendar.HOUR_OF_DAY);
+                int currentApiKey = clockHour + 1;
+                int previousApiKey = currentApiKey - 1;
                 double total = 0.0;
 
                 for (int i = 0; i < count; i++) {
                     SurflinkStats item = links.get(i);
-                    item.todayBtp = api.getHourlyEarnings(item.fullName, today);
-                    item.last10MinutesBtp = api.getEarnings(
-                            item.fullName, tenMinutesAgoUnix, nowUnix);
-                    total += item.todayBtp;
+                    Map<Integer, Double> hourly = api.getHourlyEarningsBreakdown(item.fullName, today);
+
+                    double dayTotal = 0.0;
+                    for (Double value : hourly.values()) {
+                        if (value != null) {
+                            dayTotal += value;
+                        }
+                    }
+                    item.todayApiBtp = dayTotal;
+
+                    item.currentHourKnown = hourly.containsKey(currentApiKey);
+                    item.currentHourBtp = valueOrZero(hourly.get(currentApiKey));
+
+                    if (previousApiKey >= 1) {
+                        item.previousHourKnown = hourly.containsKey(previousApiKey);
+                        item.previousHourBtp = valueOrZero(hourly.get(previousApiKey));
+                    } else {
+                        item.previousHourKnown = false;
+                        item.previousHourBtp = 0.0;
+                    }
+
+                    total += item.todayApiBtp;
                 }
 
                 final int displayed = count;
@@ -305,9 +338,11 @@ public final class MainActivity extends Activity {
                 final double totalResult = total;
                 final int remaining = api.getRateLimitRemaining();
                 final String limit = api.getRateLimit();
+                final int currentClockHour = clockHour;
 
                 runOnUiThread(() -> {
-                    renderSuccess(result, displayed, totalResult, remaining, limit);
+                    renderSuccess(result, displayed, totalResult, remaining, limit,
+                            currentClockHour);
                     if (showToast) {
                         Toast.makeText(this, "Aktualisiert", Toast.LENGTH_SHORT).show();
                     }
@@ -327,12 +362,26 @@ public final class MainActivity extends Activity {
     }
 
     private void renderSuccess(List<SurflinkStats> links, int count, double total,
-                               int remaining, String limit) {
+                               int remaining, String limit, int currentClockHour) {
         connectionStatus.setText(count >= 2
                 ? "✓ API verbunden · 2 Surflinks gefunden"
                 : "✓ API verbunden · nur " + count + " Surflink(s) gefunden");
         connectionStatus.setTextColor(Color.rgb(21, 128, 61));
-        totalToday.setText("Heute gesamt: " + btp(total));
+        totalToday.setText("Heute laut API: " + btp(total));
+
+        boolean anyCurrentPositive = false;
+        for (int i = 0; i < count; i++) {
+            if (links.get(i).currentHourBtp > BTP_EPSILON) {
+                anyCurrentPositive = true;
+                break;
+            }
+        }
+        summaryHint.setText(anyCurrentPositive
+                ? "Die API enthält bereits BTP für die laufende Stunde."
+                : "Laufende Stunde noch nicht bestätigt. Webseite/CSV kann bereits weiter sein.");
+        summaryHint.setTextColor(anyCurrentPositive
+                ? Color.rgb(21, 128, 61)
+                : Color.rgb(180, 83, 9));
 
         long now = System.currentTimeMillis();
         getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -346,7 +395,7 @@ public final class MainActivity extends Activity {
 
         for (int i = 0; i < 2; i++) {
             if (i < count) {
-                renderSurfbar(i, links.get(i));
+                renderSurfbar(i, links.get(i), currentClockHour);
             } else {
                 clearSurfbar(i);
             }
@@ -354,21 +403,36 @@ public final class MainActivity extends Activity {
         updateRefreshAvailability();
     }
 
-    private void renderSurfbar(int index, SurflinkStats item) {
+    private void renderSurfbar(int index, SurflinkStats item, int currentClockHour) {
         surfName[index].setText(item.fullName.isEmpty() ? "Unbenannter Surflink" : item.fullName);
-        surfToday[index].setText("Heute: " + btp(item.todayBtp));
-        surfTenMinutes[index].setText("Letzte 10 Minuten: " + btp(item.last10MinutesBtp));
+        surfToday[index].setText("Heute laut API: " + btp(item.todayApiBtp));
 
-        if (item.last10MinutesBtp > BTP_EPSILON) {
-            surfStatus[index].setText("● BTP-GUTSCHRIFT AKTIV");
+        String currentWindow = hourWindow(currentClockHour);
+        if (item.currentHourBtp > BTP_EPSILON) {
+            surfStatus[index].setText("● BTP IN LAUFENDER STUNDE BESTÄTIGT");
             surfStatus[index].setTextColor(Color.rgb(21, 128, 61));
-            surfTenMinutes[index].setTextColor(Color.rgb(21, 128, 61));
+            surfCurrentHour[index].setText(
+                    "Aktuelle Stunde " + currentWindow + ": " + btp(item.currentHourBtp));
+            surfCurrentHour[index].setTextColor(Color.rgb(21, 128, 61));
         } else {
-            surfStatus[index].setText("● DERZEIT KEINE BTP-GUTSCHRIFT");
+            surfStatus[index].setText("● LAUFENDE STUNDE NOCH NICHT BESTÄTIGT");
             surfStatus[index].setTextColor(Color.rgb(180, 83, 9));
-            surfTenMinutes[index].setText(
-                    "Letzte 10 Minuten: 0 BTP · Browser kann trotzdem Seiten laden");
-            surfTenMinutes[index].setTextColor(Color.rgb(180, 83, 9));
+            surfCurrentHour[index].setText(
+                    "Aktuelle Stunde " + currentWindow + ": API derzeit 0/kein Wert · kein Offline-Nachweis");
+            surfCurrentHour[index].setTextColor(Color.rgb(180, 83, 9));
+        }
+
+        int previousClockHour = currentClockHour == 0 ? 23 : currentClockHour - 1;
+        if (item.previousHourKnown) {
+            surfPreviousHour[index].setText(
+                    "Vorherige Stunde " + hourWindow(previousClockHour) + ": "
+                            + btp(item.previousHourBtp));
+        } else if (currentClockHour == 0) {
+            surfPreviousHour[index].setText(
+                    "Vorherige Stunde 23:00–23:59: nicht aus heutiger API-Antwort verfügbar");
+        } else {
+            surfPreviousHour[index].setText(
+                    "Vorherige Stunde " + hourWindow(previousClockHour) + ": –");
         }
 
         surfLast[index].setText("API lastActivity: " + emptyDash(item.lastActivity)
@@ -379,9 +443,10 @@ public final class MainActivity extends Activity {
         surfName[index].setText("Kein weiterer Surflink");
         surfStatus[index].setText("● Keine Daten");
         surfStatus[index].setTextColor(Color.rgb(107, 114, 128));
-        surfToday[index].setText("Heute: –");
-        surfTenMinutes[index].setText("Letzte 10 Minuten: –");
-        surfTenMinutes[index].setTextColor(Color.rgb(75, 85, 99));
+        surfToday[index].setText("Heute laut API: –");
+        surfCurrentHour[index].setText("Aktuelle Stunde: –");
+        surfCurrentHour[index].setTextColor(Color.rgb(75, 85, 99));
+        surfPreviousHour[index].setText("Vorherige Stunde: –");
         surfLast[index].setText("API lastActivity: –");
     }
 
@@ -442,7 +507,7 @@ public final class MainActivity extends Activity {
 
     private String berlinDate() {
         SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd", Locale.GERMANY);
-        format.setTimeZone(TimeZone.getTimeZone("Europe/Berlin"));
+        format.setTimeZone(BERLIN);
         return format.format(new Date());
     }
 
@@ -456,6 +521,15 @@ public final class MainActivity extends Activity {
     private String formatTime(long millis) {
         return DateFormat.getTimeInstance(DateFormat.MEDIUM, Locale.GERMANY)
                 .format(new Date(millis));
+    }
+
+    private static double valueOrZero(Double value) {
+        return value == null ? 0.0 : value;
+    }
+
+    private static String hourWindow(int hour) {
+        int safeHour = ((hour % 24) + 24) % 24;
+        return String.format(Locale.GERMANY, "%02d:00–%02d:59", safeHour, safeHour);
     }
 
     private static String emptyDash(String value) {

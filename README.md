@@ -2,48 +2,39 @@
 
 Android-App zum Überwachen von zwei eBesucher-Surflinks über die offizielle eBesucher-API.
 
-## Version 0.1.2
+## Version 0.1.4
 
 ### Neu
 
-- Status basiert nicht mehr auf `lastActivity`, sondern auf dem **BTP-Zuwachs zwischen erfolgreichen Prüfungen**
-- **VERDIENT AKTUELL**: BTP sind seit der letzten Prüfung gestiegen
-- **KEIN NEUER VERDIENST**: seit der letzten Prüfung kein Zuwachs, aber ausdrücklich kein Offline-Nachweis
-- **MÖGLICHER STILLSTAND**: mindestens 15 Minuten ohne neuen BTP-Zuwachs
-- erste Messung wird als **NOCH NICHT BEURTEILBAR** behandelt
-- `lastActivity` bleibt nur als API-Zusatzinfo sichtbar
-- lokale Baseline und Zeitpunkt des letzten BTP-Zuwachses werden gespeichert
-- Rate-Limit-Countdown deaktiviert den Button bis eine vollständige Prüfung wieder sicher möglich ist
-- API-Limit wird verständlich als `x von y Anfragen verfügbar` dargestellt
-- die Zeit der **letzten erfolgreichen Aktualisierung** bleibt auch bei Fehlern erhalten
+- entfernt die irreführende 10-Minuten-Auswertung aus v0.1.3
+- wertet die offizielle Stundenstatistik `earnings_hourly` direkt aus
+- zeigt pro Surfbar:
+  - **Heute laut API**
+  - **Aktuelle Stunde**
+  - **Vorherige Stunde**
+  - `lastActivity` nur als Zusatzinfo
+- ein positiver Wert in der laufenden Stunde wird als **BTP IN LAUFENDER STUNDE BESTÄTIGT** angezeigt
+- 0 BTP oder ein fehlender Wert in der laufenden Stunde wird ausdrücklich **nicht** mehr als Stillstand oder Offline-Zustand bewertet
+- Hinweis in der App: Webseite und CSV können bei der laufenden Stunde bereits weiter sein als die API
+- vollständiger Refresh benötigt nur noch 3 API-Requests statt 5
 
-### Weitere Funktionen
+## Warum die Logik erneut geändert wurde
 
-- zeigt automatisch die 2 zuletzt aktiven Surflinks aus der API
-- BTP heute je Surflink
-- BTP der letzten 60 Minuten je Surflink
-- Gesamt-BTP der beiden angezeigten Surflinks
-- manuelle Aktualisierung
-- automatische Aktualisierung alle 2 Minuten, solange die App geöffnet ist
-- benötigt nur eBesucher-Benutzername + API-Key, nicht das normale Passwort
+Ein Vergleich mit der eBesucher-Webstatistik und einer exportierten CSV zeigte, dass die laufende Stunde auf der Webseite bereits BTP enthalten kann, während die öffentliche API für denselben Zeitraum noch 0 oder keinen aktuellen Wert liefert. Deshalb darf ein 0-Wert der laufenden Stunde nicht als Beweis für fehlende Vergütung verwendet werden.
 
-## Warum die Statuslogik geändert wurde
+Die App unterscheidet jetzt bewusst zwischen:
 
-`lastActivity` erwies sich nicht als zuverlässiger Live-Heartbeat für den geöffneten Browser. Eine Surfbar kann sichtbar weiter Webseiten laden, während der API-Wert deutlich älter ist. Deshalb behauptet die App seit v0.1.2 nicht mehr allein aufgrund dieses Feldes, eine Surfbar sei offline.
-
-Der Monitor beantwortet stattdessen die belastbarere Frage: **Steigen die verdienten BTP weiter?**
-
-Auch länger ausbleibender Verdienst ist kein sicherer Beweis dafür, dass der Browser gestoppt ist. Darum lautet die stärkste Warnung bewusst nur **MÖGLICHER STILLSTAND**.
+- **positiver Stundenwert vorhanden** → BTP-Verdienst für die laufende Stunde ist durch die API bestätigt
+- **0 oder kein aktueller Stundenwert** → die API bestätigt die laufende Stunde noch nicht; kein Offline-Nachweis
 
 ## eBesucher API
 
 Verwendete Endpunkte:
 
 - `visitor_exchange.json/surflinks`
-- `visitor_exchange.json/surflink/{name}/earnings_hourly/{date}`
-- `visitor_exchange.json/surflink/{name}/earnings/{from}-{to}`
+- `visitor_exchange.json/surflink/{name}/earnings_hourly/{date}?timezone=Europe/Berlin`
 
-Eine vollständige Aktualisierung benötigt derzeit 5 Requests. Der lokale Client begrenzt sich auf 5 Requests pro rollender Minute und lässt damit Reserve zum gemeldeten Server-Limit von 7 Requests pro Minute.
+Die eBesucher-Dokumentation beschreibt die Stundenstatistik mit Werten von 1 bis 24. In der App wird deshalb die lokale Berliner Uhrzeit auf diese API-Schlüssel abgebildet.
 
 ## Android-Kompatibilität
 
@@ -58,17 +49,18 @@ Bei jedem Push auf `main` startet GitHub Actions den Workflow **Android APK**.
 
 Nach erfolgreichem Build befindet sich unter **Artifacts**:
 
-`eBesucher-Monitor-v0.1.2-debug`
+`eBesucher-Monitor-v0.1.4-debug`
 
 ## Datenschutz
 
-Benutzername, API-Key und lokale Messwerte werden ausschließlich in den Android-App-Einstellungen (`SharedPreferences`) gespeichert. Netzwerkzugriffe gehen direkt an `https://www.ebesucher.de/api/`.
+Benutzername und API-Key werden ausschließlich in den Android-App-Einstellungen (`SharedPreferences`) gespeichert. Netzwerkzugriffe gehen direkt an `https://www.ebesucher.de/api/`.
 
 ## Grenzen
 
+- Die öffentliche API kann der Webseite bei der laufenden Stunde zeitlich hinterherhinken.
+- Die App kann nicht sicher feststellen, ob ein Browser-Tab technisch geöffnet ist.
+- `lastActivity` ist kein zuverlässiger Live-Heartbeat und wird deshalb nur als Zusatzinformation angezeigt.
 - Die App überwacht, sie startet oder repariert eine Surfbar nicht automatisch.
-- Sie kann über die API nicht sicher erkennen, ob ein Browser-Tab technisch noch geöffnet ist.
-- `MÖGLICHER STILLSTAND` bedeutet nur: über längere Zeit kein neuer BTP-Zuwachs.
 - Die automatische Aktualisierung läuft nur, solange die App aktiv ist.
 
 Dieses Projekt ist ein privates Monitoring-Werkzeug und kein offizielles Produkt von eBesucher.de.

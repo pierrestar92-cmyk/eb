@@ -6,8 +6,12 @@ public final class SurflinkStats {
     public final String url;
     public final String lastActivity;
     public final long lastActivityMillis;
-    public double todayBtp;
-    public double last10MinutesBtp;
+
+    public double todayApiBtp;
+    public boolean currentHourKnown;
+    public double currentHourBtp;
+    public boolean previousHourKnown;
+    public double previousHourBtp;
 
     public SurflinkStats(long id, String fullName, String url, String lastActivity, long lastActivityMillis) {
         this.id = id;

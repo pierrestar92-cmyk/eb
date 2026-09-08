@@ -20,20 +20,23 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.TimeZone;
 
 public final class EbesucherApi {
     private static final String BASE_URL = "https://www.ebesucher.de/api/";
     private static final TimeZone BERLIN = TimeZone.getTimeZone("Europe/Berlin");
 
-    // eBesucher meldet derzeit 7 Requests/Minute. Ein kompletter Monitor-Durchlauf
-    // benötigt 5 Requests. Deshalb lassen wir zwei Requests Reserve.
+    // Ein v0.1.4-Refresh benötigt 3 Requests: Surflinks + 2 Stundenstatistiken.
+    // Lokal bleiben maximal 5 Requests im rollenden Minutenfenster erlaubt.
     private static final Object LOCAL_RATE_LOCK = new Object();
     private static final ArrayDeque<Long> LOCAL_REQUESTS = new ArrayDeque<>();
     private static final int LOCAL_MAX_REQUESTS_PER_MINUTE = 5;
+    private static final int REQUESTS_PER_FULL_REFRESH = 3;
     private static final long LOCAL_RATE_WINDOW_MS = 60_000L;
 
     private final String authorization;
@@ -68,7 +71,7 @@ public final class EbesucherApi {
         return result;
     }
 
-    public double getHourlyEarnings(String fullName, String yyyyMmDd)
+    public Map<Integer, Double> getHourlyEarningsBreakdown(String fullName, String yyyyMmDd)
             throws IOException, JSONException {
         String path = "visitor_exchange.json/surflink/"
                 + Uri.encode(fullName)
@@ -76,17 +79,35 @@ public final class EbesucherApi {
                 + Uri.encode(yyyyMmDd)
                 + "?timezone=Europe%2FBerlin";
         Object json = new JSONTokener(get(path)).nextValue();
-        return sumNumericValues(json);
-    }
+        Map<Integer, Double> result = new HashMap<>();
 
-    public double getEarnings(String fullName, long fromUnix, long toUnix)
-            throws IOException, JSONException {
-        String path = "visitor_exchange.json/surflink/"
-                + Uri.encode(fullName)
-                + "/earnings/"
-                + fromUnix + "-" + toUnix;
-        Object json = new JSONTokener(get(path)).nextValue();
-        return sumEarningsRows(json);
+        if (json instanceof JSONObject) {
+            JSONObject object = (JSONObject) json;
+            Iterator<String> keys = object.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                try {
+                    int hourKey = Integer.parseInt(key);
+                    if (hourKey >= 1 && hourKey <= 24) {
+                        result.put(hourKey, asDouble(object.opt(key)));
+                    }
+                } catch (NumberFormatException ignored) {
+                    // Unbekannte Metadatenfelder ignorieren.
+                }
+            }
+            return result;
+        }
+
+        if (json instanceof JSONArray) {
+            JSONArray array = (JSONArray) json;
+            int max = Math.min(24, array.length());
+            for (int i = 0; i < max; i++) {
+                result.put(i + 1, asDouble(array.opt(i)));
+            }
+            return result;
+        }
+
+        throw new JSONException("Unerwartete Stundenstatistik-Antwort");
     }
 
     public int getRateLimitRemaining() {
@@ -97,20 +118,23 @@ public final class EbesucherApi {
         return rateLimit;
     }
 
-    /**
-     * Ein kompletter Refresh braucht alle 5 lokalen Request-Slots. Solange noch
-     * ein Request im rollenden Minutenfenster liegt, warten wir bis auch der
-     * neueste alte Request abgelaufen ist. So bricht ein Refresh nicht mitten drin ab.
-     */
     public static long secondsUntilFullRefreshAvailable() {
         synchronized (LOCAL_RATE_LOCK) {
             long now = System.currentTimeMillis();
             purgeOldRequests(now);
-            if (LOCAL_REQUESTS.isEmpty()) {
+
+            int freeSlots = LOCAL_MAX_REQUESTS_PER_MINUTE - LOCAL_REQUESTS.size();
+            if (freeSlots >= REQUESTS_PER_FULL_REFRESH) {
                 return 0L;
             }
-            long newest = LOCAL_REQUESTS.peekLast();
-            long waitMs = Math.max(0L, LOCAL_RATE_WINDOW_MS - (now - newest));
+
+            int requestsThatMustExpire = REQUESTS_PER_FULL_REFRESH - freeSlots;
+            Iterator<Long> iterator = LOCAL_REQUESTS.iterator();
+            long target = now;
+            for (int i = 0; i < requestsThatMustExpire && iterator.hasNext(); i++) {
+                target = iterator.next();
+            }
+            long waitMs = Math.max(0L, LOCAL_RATE_WINDOW_MS - (now - target));
             return waitMs <= 0L ? 0L : Math.max(1L, (waitMs + 999L) / 1000L);
         }
     }
@@ -128,7 +152,7 @@ public final class EbesucherApi {
             connection.setUseCaches(false);
             connection.setRequestProperty("Accept", "application/json");
             connection.setRequestProperty("Authorization", authorization);
-            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1.2");
+            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1.4");
 
             int status = connection.getResponseCode();
             updateRateLimit(connection);
@@ -176,11 +200,11 @@ public final class EbesucherApi {
             purgeOldRequests(now);
 
             if (LOCAL_REQUESTS.size() >= LOCAL_MAX_REQUESTS_PER_MINUTE) {
-                long newest = LOCAL_REQUESTS.peekLast();
-                long waitMs = Math.max(1L, LOCAL_RATE_WINDOW_MS - (now - newest));
+                long oldest = LOCAL_REQUESTS.peekFirst();
+                long waitMs = Math.max(1L, LOCAL_RATE_WINDOW_MS - (now - oldest));
                 long waitSeconds = Math.max(1L, (waitMs + 999L) / 1000L);
                 throw new IOException("Rate-Limit-Schutz aktiv: Bitte noch " + waitSeconds
-                        + " Sekunden bis zur nächsten vollständigen Prüfung warten.");
+                        + " Sekunden warten.");
             }
 
             LOCAL_REQUESTS.addLast(now);
@@ -235,43 +259,6 @@ public final class EbesucherApi {
         } catch (ParseException ignored) {
             return 0L;
         }
-    }
-
-    private static double sumNumericValues(Object json) throws JSONException {
-        double total = 0.0;
-        if (json instanceof JSONObject) {
-            JSONObject object = (JSONObject) json;
-            Iterator<String> keys = object.keys();
-            while (keys.hasNext()) {
-                total += asDouble(object.opt(keys.next()));
-            }
-            return total;
-        }
-        if (json instanceof JSONArray) {
-            JSONArray array = (JSONArray) json;
-            for (int i = 0; i < array.length(); i++) {
-                total += asDouble(array.opt(i));
-            }
-            return total;
-        }
-        return asDouble(json);
-    }
-
-    private static double sumEarningsRows(Object json) throws JSONException {
-        if (!(json instanceof JSONArray)) {
-            return sumNumericValues(json);
-        }
-        JSONArray array = (JSONArray) json;
-        double total = 0.0;
-        for (int i = 0; i < array.length(); i++) {
-            Object value = array.opt(i);
-            if (value instanceof JSONObject) {
-                total += asDouble(((JSONObject) value).opt("value"));
-            } else {
-                total += asDouble(value);
-            }
-        }
-        return total;
     }
 
     private static double asDouble(Object value) {
