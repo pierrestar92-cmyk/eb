@@ -1,7 +1,6 @@
 package de.pierre.ebesuchermonitor;
 
 import android.app.Activity;
-import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
@@ -38,13 +37,22 @@ public final class MainActivity extends Activity {
     private static final String PREF_USER = "username";
     private static final String PREF_KEY = "api_key";
     private static final String PREF_AUTO = "auto_refresh";
+    private static final String PREF_LAST_SUCCESS = "last_success";
+
+    private static final String PREF_EARN_DAY = "earn_day_";
+    private static final String PREF_EARN_TOTAL = "earn_total_";
+    private static final String PREF_LAST_GAIN = "last_gain_";
+
     private static final long REFRESH_INTERVAL_MS = 120_000L;
+    private static final long POSSIBLE_STALL_AFTER_MS = 15L * 60L * 1000L;
+    private static final double BTP_EPSILON = 0.005;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final TextView[] surfName = new TextView[2];
     private final TextView[] surfStatus = new TextView[2];
     private final TextView[] surfToday = new TextView[2];
+    private final TextView[] surfDelta = new TextView[2];
     private final TextView[] surfHour = new TextView[2];
     private final TextView[] surfLast = new TextView[2];
 
@@ -56,8 +64,11 @@ public final class MainActivity extends Activity {
     private TextView totalToday;
     private TextView rateLimit;
     private TextView updatedAt;
+
     private volatile boolean refreshing;
     private boolean resumed;
+    private int lastServerRemaining = -1;
+    private String lastServerLimit = "";
 
     private final Runnable autoRefreshTask = new Runnable() {
         @Override
@@ -69,6 +80,17 @@ public final class MainActivity extends Activity {
                 refreshData(false);
             }
             handler.postDelayed(this, REFRESH_INTERVAL_MS);
+        }
+    };
+
+    private final Runnable rateCountdownTask = new Runnable() {
+        @Override
+        public void run() {
+            if (!resumed) {
+                return;
+            }
+            updateRefreshAvailability();
+            handler.postDelayed(this, 1_000L);
         }
     };
 
@@ -89,13 +111,16 @@ public final class MainActivity extends Activity {
         super.onResume();
         resumed = true;
         handler.removeCallbacks(autoRefreshTask);
+        handler.removeCallbacks(rateCountdownTask);
         handler.postDelayed(autoRefreshTask, REFRESH_INTERVAL_MS);
+        handler.post(rateCountdownTask);
     }
 
     @Override
     protected void onPause() {
         resumed = false;
         handler.removeCallbacks(autoRefreshTask);
+        handler.removeCallbacks(rateCountdownTask);
         super.onPause();
     }
 
@@ -120,7 +145,7 @@ public final class MainActivity extends Activity {
         TextView title = text("eBesucher Monitor", 28, true, Color.rgb(17, 24, 39));
         root.addView(title);
 
-        TextView subtitle = text("Version 0.1 · 2 zuletzt aktive Surflinks", 14, false,
+        TextView subtitle = text("Version 0.1.2 · Verdienst-basierter Status", 14, false,
                 Color.rgb(75, 85, 99));
         subtitle.setPadding(0, dp(3), 0, dp(14));
         root.addView(subtitle);
@@ -178,7 +203,8 @@ public final class MainActivity extends Activity {
         summary.addView(text("Übersicht", 19, true, Color.rgb(17, 24, 39)));
         totalToday = text("Heute gesamt: –", 22, true, Color.rgb(37, 99, 235));
         summary.addView(totalToday, topMargin(8));
-        updatedAt = text("Letzte Aktualisierung: –", 13, false, Color.rgb(75, 85, 99));
+        updatedAt = text("Letzte erfolgreiche Aktualisierung: –", 13, false,
+                Color.rgb(75, 85, 99));
         summary.addView(updatedAt, topMargin(5));
         rateLimit = text("API-Limit: –", 12, false, Color.rgb(107, 114, 128));
         summary.addView(rateLimit, topMargin(3));
@@ -187,8 +213,9 @@ public final class MainActivity extends Activity {
         root.addView(buildSurfbarCard(1), spacedParams());
 
         TextView note = text(
-                "Statuslogik v0.1: Aktiv ≤ 3 Min · Verzögert ≤ 10 Min · Offline > 10 Min. "
-                        + "Die App überwacht nur und startet die Surfbar nicht selbst.",
+                "Statuslogik v0.1.2: Entscheidend ist der BTP-Zuwachs zwischen zwei erfolgreichen "
+                        + "Prüfungen. lastActivity wird nur noch als API-Zusatzinfo angezeigt. "
+                        + "Kein Zuwachs bedeutet nicht automatisch, dass der Browser gestoppt ist.",
                 12, false, Color.rgb(75, 85, 99));
         note.setPadding(dp(4), dp(2), dp(4), 0);
         root.addView(note);
@@ -203,22 +230,38 @@ public final class MainActivity extends Activity {
         surfName[index] = text("–", 20, true, Color.rgb(17, 24, 39));
         card.addView(surfName[index], topMargin(4));
 
-        surfStatus[index] = text("● Noch keine Daten", 15, true, Color.rgb(107, 114, 128));
+        surfStatus[index] = text("● Noch nicht beurteilbar", 15, true,
+                Color.rgb(107, 114, 128));
         card.addView(surfStatus[index], topMargin(8));
 
         surfToday[index] = text("Heute: –", 18, true, Color.rgb(17, 24, 39));
         card.addView(surfToday[index], topMargin(10));
 
+        surfDelta[index] = text("Seit letzter Prüfung: –", 14, true,
+                Color.rgb(75, 85, 99));
+        card.addView(surfDelta[index], topMargin(4));
+
         surfHour[index] = text("Letzte 60 Minuten: –", 14, false, Color.rgb(55, 65, 81));
         card.addView(surfHour[index], topMargin(4));
 
-        surfLast[index] = text("Letzte Aktivität: –", 13, false, Color.rgb(75, 85, 99));
+        surfLast[index] = text("API lastActivity: –", 12, false, Color.rgb(107, 114, 128));
         card.addView(surfLast[index], topMargin(4));
         return card;
     }
 
     private void refreshData(boolean showToast) {
         if (refreshing) {
+            return;
+        }
+
+        long localWait = EbesucherApi.secondsUntilFullRefreshAvailable();
+        if (localWait > 0L) {
+            updateRefreshAvailability();
+            if (showToast) {
+                Toast.makeText(this,
+                        "Nächste vollständige Prüfung in " + localWait + " Sekunden.",
+                        Toast.LENGTH_SHORT).show();
+            }
             return;
         }
 
@@ -285,7 +328,7 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> renderError(finalMessage));
             } finally {
                 refreshing = false;
-                runOnUiThread(() -> refreshButton.setEnabled(true));
+                runOnUiThread(this::updateRefreshAvailability);
             }
         });
     }
@@ -297,15 +340,16 @@ public final class MainActivity extends Activity {
                 : "✓ API verbunden · nur " + count + " Surflink(s) gefunden");
         connectionStatus.setTextColor(Color.rgb(21, 128, 61));
         totalToday.setText("Heute gesamt: " + btp(total));
-        updatedAt.setText("Letzte Aktualisierung: "
-                + DateFormat.getTimeInstance(DateFormat.MEDIUM, Locale.GERMANY).format(new Date()));
 
-        if (remaining >= 0) {
-            rateLimit.setText("API-Limit: " + remaining + " übrig"
-                    + (limit == null || limit.isEmpty() ? "" : " · " + limit));
-        } else {
-            rateLimit.setText("API-Limit: vom Server nicht gemeldet");
-        }
+        long now = System.currentTimeMillis();
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+                .putLong(PREF_LAST_SUCCESS, now)
+                .apply();
+        updatedAt.setText("Letzte erfolgreiche Aktualisierung: " + formatTime(now));
+
+        lastServerRemaining = remaining;
+        lastServerLimit = limit == null ? "" : limit;
 
         for (int i = 0; i < 2; i++) {
             if (i < count) {
@@ -314,6 +358,7 @@ public final class MainActivity extends Activity {
                 clearSurfbar(i);
             }
         }
+        updateRefreshAvailability();
     }
 
     private void renderSurfbar(int index, SurflinkStats item) {
@@ -321,27 +366,86 @@ public final class MainActivity extends Activity {
         surfToday[index].setText("Heute: " + btp(item.todayBtp));
         surfHour[index].setText("Letzte 60 Minuten: " + btp(item.last60MinutesBtp));
 
-        if (item.lastActivityMillis <= 0L) {
-            surfStatus[index].setText("● Status unbekannt");
-            surfStatus[index].setTextColor(Color.rgb(107, 114, 128));
-            surfLast[index].setText("Letzte Aktivität: " + emptyDash(item.lastActivity));
-            return;
+        EarningsState state = evaluateEarningsState(item);
+        surfStatus[index].setText(state.statusText);
+        surfStatus[index].setTextColor(state.statusColor);
+        surfDelta[index].setText(state.deltaText);
+        surfDelta[index].setTextColor(state.deltaColor);
+
+        surfLast[index].setText("API lastActivity: " + emptyDash(item.lastActivity)
+                + " · nur Zusatzinfo");
+    }
+
+    private EarningsState evaluateEarningsState(SurflinkStats item) {
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String suffix = item.fullName == null ? "" : item.fullName;
+        String dayKey = PREF_EARN_DAY + suffix;
+        String totalKey = PREF_EARN_TOTAL + suffix;
+        String gainKey = PREF_LAST_GAIN + suffix;
+
+        String today = berlinDate();
+        String storedDay = prefs.getString(dayKey, "");
+        String previousText = prefs.getString(totalKey, null);
+        long now = System.currentTimeMillis();
+        long lastGain = prefs.getLong(gainKey, 0L);
+
+        boolean validPrevious = today.equals(storedDay) && previousText != null;
+        double previous = Double.NaN;
+        if (validPrevious) {
+            try {
+                previous = Double.parseDouble(previousText);
+            } catch (NumberFormatException ignored) {
+                validPrevious = false;
+            }
         }
 
-        long ageMs = Math.max(0L, System.currentTimeMillis() - item.lastActivityMillis);
-        long ageMinutes = ageMs / 60_000L;
-        if (ageMs <= 180_000L) {
-            surfStatus[index].setText("● AKTIV");
-            surfStatus[index].setTextColor(Color.rgb(21, 128, 61));
-        } else if (ageMs <= 600_000L) {
-            surfStatus[index].setText("● VERZÖGERT");
-            surfStatus[index].setTextColor(Color.rgb(180, 83, 9));
+        EarningsState state;
+        if (!validPrevious || Double.isNaN(previous)
+                || item.todayBtp + BTP_EPSILON < previous) {
+            lastGain = now;
+            state = new EarningsState(
+                    "● NOCH NICHT BEURTEILBAR",
+                    Color.rgb(107, 114, 128),
+                    "Seit letzter Prüfung: Baseline gespeichert",
+                    Color.rgb(75, 85, 99));
         } else {
-            surfStatus[index].setText("● OFFLINE / KEINE AKTIVITÄT");
-            surfStatus[index].setTextColor(Color.rgb(185, 28, 28));
+            double delta = item.todayBtp - previous;
+            if (delta > BTP_EPSILON) {
+                lastGain = now;
+                state = new EarningsState(
+                        "● VERDIENT AKTUELL",
+                        Color.rgb(21, 128, 61),
+                        "Seit letzter Prüfung: +" + btp(delta),
+                        Color.rgb(21, 128, 61));
+            } else {
+                if (lastGain <= 0L) {
+                    lastGain = now;
+                }
+                long withoutGainMs = Math.max(0L, now - lastGain);
+                long minutes = withoutGainMs / 60_000L;
+                if (withoutGainMs >= POSSIBLE_STALL_AFTER_MS) {
+                    state = new EarningsState(
+                            "● MÖGLICHER STILLSTAND",
+                            Color.rgb(185, 28, 28),
+                            "Kein neuer Verdienst seit ca. " + minutes
+                                    + " Min · Browser kann trotzdem noch laufen",
+                            Color.rgb(185, 28, 28));
+                } else {
+                    state = new EarningsState(
+                            "● KEIN NEUER VERDIENST",
+                            Color.rgb(180, 83, 9),
+                            "Seit letzter Prüfung: +0 BTP · noch kein Offline-Nachweis",
+                            Color.rgb(180, 83, 9));
+                }
+            }
         }
-        surfLast[index].setText("Letzte Aktivität: " + item.lastActivity
-                + " · vor ca. " + ageMinutes + " Min");
+
+        prefs.edit()
+                .putString(dayKey, today)
+                .putString(totalKey, Double.toString(item.todayBtp))
+                .putLong(gainKey, lastGain)
+                .apply();
+        return state;
     }
 
     private void clearSurfbar(int index) {
@@ -349,15 +453,42 @@ public final class MainActivity extends Activity {
         surfStatus[index].setText("● Keine Daten");
         surfStatus[index].setTextColor(Color.rgb(107, 114, 128));
         surfToday[index].setText("Heute: –");
+        surfDelta[index].setText("Seit letzter Prüfung: –");
+        surfDelta[index].setTextColor(Color.rgb(75, 85, 99));
         surfHour[index].setText("Letzte 60 Minuten: –");
-        surfLast[index].setText("Letzte Aktivität: –");
+        surfLast[index].setText("API lastActivity: –");
     }
 
     private void renderError(String message) {
         connectionStatus.setText("✕ " + message);
         connectionStatus.setTextColor(Color.rgb(185, 28, 28));
-        updatedAt.setText("Letzte Prüfung fehlgeschlagen: "
-                + DateFormat.getTimeInstance(DateFormat.MEDIUM, Locale.GERMANY).format(new Date()));
+        // Wichtig: Die Zeit der letzten erfolgreichen Aktualisierung bleibt stehen.
+        updateRefreshAvailability();
+    }
+
+    private void updateRefreshAvailability() {
+        if (refreshButton == null || rateLimit == null) {
+            return;
+        }
+
+        long wait = EbesucherApi.secondsUntilFullRefreshAvailable();
+        refreshButton.setEnabled(!refreshing && wait <= 0L);
+
+        String serverText;
+        if (lastServerRemaining >= 0 && lastServerLimit != null && !lastServerLimit.isEmpty()) {
+            serverText = "API-Limit: " + lastServerRemaining + " von " + lastServerLimit
+                    + " Anfragen verfügbar";
+        } else if (lastServerRemaining >= 0) {
+            serverText = "API-Limit: " + lastServerRemaining + " Anfragen verfügbar";
+        } else {
+            serverText = "API-Limit: –";
+        }
+
+        if (wait > 0L) {
+            rateLimit.setText(serverText + " · nächste vollständige Prüfung in " + wait + " Sek.");
+        } else {
+            rateLimit.setText(serverText + " · bereit");
+        }
     }
 
     private void loadSettings() {
@@ -365,6 +496,11 @@ public final class MainActivity extends Activity {
         usernameInput.setText(prefs.getString(PREF_USER, ""));
         apiKeyInput.setText(prefs.getString(PREF_KEY, ""));
         autoRefresh.setChecked(prefs.getBoolean(PREF_AUTO, true));
+
+        long lastSuccess = prefs.getLong(PREF_LAST_SUCCESS, 0L);
+        if (lastSuccess > 0L) {
+            updatedAt.setText("Letzte erfolgreiche Aktualisierung: " + formatTime(lastSuccess));
+        }
     }
 
     private void saveSettings() {
@@ -390,6 +526,11 @@ public final class MainActivity extends Activity {
         format.setMinimumFractionDigits(0);
         format.setMaximumFractionDigits(2);
         return format.format(value) + " BTP";
+    }
+
+    private String formatTime(long millis) {
+        return DateFormat.getTimeInstance(DateFormat.MEDIUM, Locale.GERMANY)
+                .format(new Date(millis));
     }
 
     private static String emptyDash(String value) {
@@ -443,5 +584,19 @@ public final class MainActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static final class EarningsState {
+        final String statusText;
+        final int statusColor;
+        final String deltaText;
+        final int deltaColor;
+
+        EarningsState(String statusText, int statusColor, String deltaText, int deltaColor) {
+            this.statusText = statusText;
+            this.statusColor = statusColor;
+            this.deltaText = deltaText;
+            this.deltaColor = deltaColor;
+        }
     }
 }

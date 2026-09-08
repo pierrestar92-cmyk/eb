@@ -29,8 +29,8 @@ public final class EbesucherApi {
     private static final String BASE_URL = "https://www.ebesucher.de/api/";
     private static final TimeZone BERLIN = TimeZone.getTimeZone("Europe/Berlin");
 
-    // eBesucher meldet derzeit 7 Requests/Minute. Der Client nutzt absichtlich
-    // nur 5 Requests pro rollender Minute und lässt 2 Requests Reserve.
+    // eBesucher meldet derzeit 7 Requests/Minute. Ein kompletter Monitor-Durchlauf
+    // benötigt 5 Requests. Deshalb lassen wir zwei Requests Reserve.
     private static final Object LOCAL_RATE_LOCK = new Object();
     private static final ArrayDeque<Long> LOCAL_REQUESTS = new ArrayDeque<>();
     private static final int LOCAL_MAX_REQUESTS_PER_MINUTE = 5;
@@ -97,6 +97,24 @@ public final class EbesucherApi {
         return rateLimit;
     }
 
+    /**
+     * Ein kompletter Refresh braucht alle 5 lokalen Request-Slots. Solange noch
+     * ein Request im rollenden Minutenfenster liegt, warten wir bis auch der
+     * neueste alte Request abgelaufen ist. So bricht ein Refresh nicht mitten drin ab.
+     */
+    public static long secondsUntilFullRefreshAvailable() {
+        synchronized (LOCAL_RATE_LOCK) {
+            long now = System.currentTimeMillis();
+            purgeOldRequests(now);
+            if (LOCAL_REQUESTS.isEmpty()) {
+                return 0L;
+            }
+            long newest = LOCAL_REQUESTS.peekLast();
+            long waitMs = Math.max(0L, LOCAL_RATE_WINDOW_MS - (now - newest));
+            return waitMs <= 0L ? 0L : Math.max(1L, (waitMs + 999L) / 1000L);
+        }
+    }
+
     private String get(String relativePath) throws IOException {
         guardLocalRateLimit();
 
@@ -110,7 +128,7 @@ public final class EbesucherApi {
             connection.setUseCaches(false);
             connection.setRequestProperty("Accept", "application/json");
             connection.setRequestProperty("Authorization", authorization);
-            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1.1");
+            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1.2");
 
             int status = connection.getResponseCode();
             updateRateLimit(connection);
@@ -155,20 +173,24 @@ public final class EbesucherApi {
     private static void guardLocalRateLimit() throws IOException {
         synchronized (LOCAL_RATE_LOCK) {
             long now = System.currentTimeMillis();
-            while (!LOCAL_REQUESTS.isEmpty()
-                    && now - LOCAL_REQUESTS.peekFirst() >= LOCAL_RATE_WINDOW_MS) {
-                LOCAL_REQUESTS.removeFirst();
-            }
+            purgeOldRequests(now);
 
             if (LOCAL_REQUESTS.size() >= LOCAL_MAX_REQUESTS_PER_MINUTE) {
-                long oldest = LOCAL_REQUESTS.peekFirst();
-                long waitMs = Math.max(1L, LOCAL_RATE_WINDOW_MS - (now - oldest));
+                long newest = LOCAL_REQUESTS.peekLast();
+                long waitMs = Math.max(1L, LOCAL_RATE_WINDOW_MS - (now - newest));
                 long waitSeconds = Math.max(1L, (waitMs + 999L) / 1000L);
                 throw new IOException("Rate-Limit-Schutz aktiv: Bitte noch " + waitSeconds
                         + " Sekunden bis zur nächsten vollständigen Prüfung warten.");
             }
 
             LOCAL_REQUESTS.addLast(now);
+        }
+    }
+
+    private static void purgeOldRequests(long now) {
+        while (!LOCAL_REQUESTS.isEmpty()
+                && now - LOCAL_REQUESTS.peekFirst() >= LOCAL_RATE_WINDOW_MS) {
+            LOCAL_REQUESTS.removeFirst();
         }
     }
 
