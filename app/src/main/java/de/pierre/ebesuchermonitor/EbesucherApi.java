@@ -31,7 +31,7 @@ public final class EbesucherApi {
     private static final String BASE_URL = "https://www.ebesucher.de/api/";
     private static final TimeZone BERLIN = TimeZone.getTimeZone("Europe/Berlin");
 
-    // Ein v0.1.4-Refresh benötigt 3 Requests: Surflinks + 2 Stundenstatistiken.
+    // Ein v0.2.1-Refresh benötigt 3 Requests: Surflinks + 2 Stundenstatistiken.
     // Lokal bleiben maximal 5 Requests im rollenden Minutenfenster erlaubt.
     private static final Object LOCAL_RATE_LOCK = new Object();
     private static final ArrayDeque<Long> LOCAL_REQUESTS = new ArrayDeque<>();
@@ -152,7 +152,7 @@ public final class EbesucherApi {
             connection.setUseCaches(false);
             connection.setRequestProperty("Accept", "application/json");
             connection.setRequestProperty("Authorization", authorization);
-            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1.4");
+            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.2.1");
 
             int status = connection.getResponseCode();
             updateRateLimit(connection);
