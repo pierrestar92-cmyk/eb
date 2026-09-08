@@ -81,12 +81,12 @@ import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.max
 
+private const val UI_BTP_EPSILON = 0.005
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            EbesucherMonitorApp()
-        }
+        setContent { EbesucherMonitorApp() }
     }
 }
 
@@ -125,7 +125,7 @@ private fun EbesucherMonitorApp(viewModel: MonitorViewModel = viewModel()) {
                         Column {
                             Text("eBesucher Monitor", fontWeight = FontWeight.Bold)
                             Text(
-                                "v0.2.0 · Android",
+                                "v0.2.1 · Android",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
@@ -198,7 +198,7 @@ private fun ConnectionPill(connected: Boolean, loading: Boolean) {
     }
     val label = when {
         loading -> "PRÜFT"
-        connected -> "LIVE"
+        connected -> "API LIVE"
         else -> "OFFLINE"
     }
 
@@ -238,37 +238,44 @@ private fun DashboardScreen(
         item { Spacer(Modifier.height(4.dp)) }
 
         if (!state.configured) {
-            item {
-                SetupCard(onOpenSettings)
-            }
+            item { SetupCard(onOpenSettings) }
         } else {
-            item {
-                HeroCard(state)
-            }
+            item { HeroCard(state) }
 
             item {
+                val currentConfirmed = state.currentHourBtp > UI_BTP_EPSILON
+                val previousConfirmed = state.previousHourBtp > UI_BTP_EPSILON
+                val hourLabel = when {
+                    currentConfirmed -> "Aktuelle Stunde"
+                    previousConfirmed -> "Letzte bestätigte Stunde"
+                    else -> "Stundenwert"
+                }
+                val hourValue = when {
+                    currentConfirmed -> state.currentHourBtp
+                    previousConfirmed -> state.previousHourBtp
+                    else -> 0.0
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     MetricCard(
                         modifier = Modifier.weight(1f),
-                        label = "Aktuelle Stunde",
-                        value = formatBtp(state.currentHourBtp),
+                        label = hourLabel,
+                        value = formatBtp(hourValue),
                         icon = { Icon(Icons.Rounded.Speed, null) }
                     )
                     MetricCard(
                         modifier = Modifier.weight(1f),
-                        label = "Surfbars aktiv",
-                        value = "${state.activeSurfbars} / ${state.surfbars.size}",
+                        label = "Surfbars mit Verdienst",
+                        value = "${state.earningSurfbars} / ${state.surfbars.size}",
                         icon = { Icon(Icons.Rounded.Wifi, null) }
                     )
                 }
             }
 
-            item {
-                EarningsChartCard(state.combinedHourlyBtp)
-            }
+            item { EarningsChartCard(state.combinedHourlyBtp) }
 
             if (state.error != null) {
                 item { ErrorCard(state.error, onRefresh) }
@@ -284,13 +291,8 @@ private fun DashboardScreen(
                 )
             }
 
-            items(state.surfbars, key = { it.id }) { surfbar ->
-                SurfbarCard(surfbar)
-            }
-
-            item {
-                ApiInfoCard(state)
-            }
+            items(state.surfbars, key = { it.id }) { surfbar -> SurfbarCard(surfbar) }
+            item { ApiInfoCard(state) }
         }
 
         item { Spacer(Modifier.height(20.dp)) }
@@ -323,7 +325,9 @@ private fun SetupCard(onOpenSettings: () -> Unit) {
 @Composable
 private fun HeroCard(state: DashboardUiState) {
     Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+        ),
         shape = RoundedCornerShape(28.dp)
     ) {
         Column(Modifier.padding(22.dp)) {
@@ -340,7 +344,15 @@ private fun HeroCard(state: DashboardUiState) {
                 lineHeight = 40.sp,
                 fontWeight = FontWeight.Black
             )
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
+            if (state.currentHourBtp <= UI_BTP_EPSILON && state.previousHourBtp > UI_BTP_EPSILON) {
+                Text(
+                    "Aktuelle Stunde: noch keine bestätigten API-BTP",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFFF5B942)
+                )
+                Spacer(Modifier.height(5.dp))
+            }
             Text(
                 if (state.lastUpdatedMillis > 0L) {
                     "Aktualisiert ${formatClock(state.lastUpdatedMillis)}"
@@ -372,9 +384,7 @@ private fun MetricCard(
                     .size(34.dp)
                     .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f), CircleShape),
                 contentAlignment = Alignment.Center
-            ) {
-                icon()
-            }
+            ) { icon() }
             Spacer(Modifier.height(12.dp))
             Text(value, fontSize = 18.sp, fontWeight = FontWeight.Bold)
             Text(
@@ -403,16 +413,12 @@ private fun EarningsChartCard(values: List<Float>) {
                 Column(Modifier.weight(1f)) {
                     Text("Verdienst heute", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                     Text(
-                        "Stündliche API-Werte",
+                        "Stündlich bestätigte API-Werte",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Text(
-                    "24 h",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary
-                )
+                Text("24 h", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
             }
             Spacer(Modifier.height(16.dp))
             Canvas(
@@ -433,11 +439,9 @@ private fun EarningsChartCard(values: List<Float>) {
                 }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("00", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("06", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("12", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("18", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("24", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                listOf("00", "06", "12", "18", "24").forEach { label ->
+                    Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
@@ -446,14 +450,19 @@ private fun EarningsChartCard(values: List<Float>) {
 @Composable
 private fun SurfbarCard(surfbar: SurfbarUiModel) {
     val statusColor = when (surfbar.status) {
-        SurfStatus.ACTIVE -> Color(0xFF3DDC84)
-        SurfStatus.WAITING -> Color(0xFFF5B942)
-        SurfStatus.INACTIVE -> Color(0xFFFF6B6B)
+        SurfStatus.EARNINGS_CONFIRMED -> Color(0xFF3DDC84)
+        SurfStatus.PENDING_CONFIRMATION -> Color(0xFFF5B942)
+        SurfStatus.NO_EARNINGS -> Color(0xFFFF6B6B)
     }
     val statusLabel = when (surfbar.status) {
-        SurfStatus.ACTIVE -> "Aktiv"
-        SurfStatus.WAITING -> "Warten auf Bestätigung"
-        SurfStatus.INACTIVE -> "Keine aktuelle Aktivität"
+        SurfStatus.EARNINGS_CONFIRMED -> "Verdienst bestätigt"
+        SurfStatus.PENDING_CONFIRMATION -> "Noch unbestätigt"
+        SurfStatus.NO_EARNINGS -> "Heute kein Verdienst"
+    }
+    val currentHourText = when {
+        surfbar.currentHourBtp > UI_BTP_EPSILON -> formatBtp(surfbar.currentHourBtp)
+        surfbar.status != SurfStatus.NO_EARNINGS -> "noch offen"
+        else -> "0 BTP"
     }
 
     Card(
@@ -490,7 +499,7 @@ private fun SurfbarCard(surfbar: SurfbarUiModel) {
 
             Row(Modifier.fillMaxWidth()) {
                 SurfMetric("Heute", formatBtp(surfbar.todayBtp), Modifier.weight(1f))
-                SurfMetric("Diese Stunde", formatBtp(surfbar.currentHourBtp), Modifier.weight(1f))
+                SurfMetric("Diese Stunde", currentHourText, Modifier.weight(1f))
                 SurfMetric("Vorher", formatBtp(surfbar.previousHourBtp), Modifier.weight(1f))
             }
         }
@@ -501,11 +510,7 @@ private fun SurfbarCard(surfbar: SurfbarUiModel) {
 private fun SurfMetric(label: String, value: String, modifier: Modifier) {
     Column(modifier) {
         Text(value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
-        Text(
-            label,
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
+        Text(label, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -530,7 +535,7 @@ private fun ApiInfoCard(state: DashboardUiState) {
             )
             Spacer(Modifier.height(5.dp))
             Text(
-                "Hinweis: Ein positiver Stundenwert bestätigt Verdienst. lastActivity wird zusätzlich ausgewertet, kann aber zeitversetzt sein.",
+                "Status bedeutet bestätigten Tagesverdienst, nicht garantiert eine gerade laufende Surfbar. lastActivity ist nur ein zusätzlicher Hinweis und kann zeitversetzt sein.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -649,10 +654,7 @@ private fun SettingsScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Switch(
-                    checked = state.autoRefresh,
-                    onCheckedChange = onAutoRefreshChanged
-                )
+                Switch(checked = state.autoRefresh, onCheckedChange = onAutoRefreshChanged)
             }
         }
 
@@ -661,11 +663,7 @@ private fun SettingsScreen(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFFFF6B6B).copy(alpha = 0.10f)),
                 shape = RoundedCornerShape(18.dp)
             ) {
-                Text(
-                    state.error,
-                    modifier = Modifier.padding(14.dp),
-                    style = MaterialTheme.typography.bodySmall
-                )
+                Text(state.error, modifier = Modifier.padding(14.dp), style = MaterialTheme.typography.bodySmall)
             }
         }
 
