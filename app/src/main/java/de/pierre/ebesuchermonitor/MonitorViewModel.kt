@@ -26,7 +26,8 @@ enum class SurfStatus {
 
 data class SurfbarUiModel(
     val id: Long,
-    val name: String,
+    val apiName: String,
+    val alias: String,
     val url: String,
     val lastActivityMillis: Long,
     val todayBtp: Double,
@@ -34,6 +35,14 @@ data class SurfbarUiModel(
     val previousHourBtp: Double,
     val hourlyBtp: List<Float>,
     val status: SurfStatus
+) {
+    val displayName: String
+        get() = alias.ifBlank { apiName }
+}
+
+data class DailyEarningsUiModel(
+    val dayStartMillis: Long,
+    val totalBtp: Double?
 )
 
 data class DashboardUiState(
@@ -43,14 +52,23 @@ data class DashboardUiState(
     val connected: Boolean = false,
     val autoRefresh: Boolean = true,
     val totalTodayBtp: Double = 0.0,
+    val deltaSinceLastRefresh: Double = 0.0,
     val currentHourBtp: Double = 0.0,
     val previousHourBtp: Double = 0.0,
+    val lastConfirmedHourBtp: Double = 0.0,
+    val lastConfirmedApiHour: Int = 0,
+    val forecastTodayBtp: Double = 0.0,
+    val averageEarningHourBtp: Double = 0.0,
+    val bestHourBtp: Double = 0.0,
+    val bestApiHour: Int = 0,
     val earningSurfbars: Int = 0,
     val surfbars: List<SurfbarUiModel> = emptyList(),
     val combinedHourlyBtp: List<Float> = List(24) { 0f },
+    val recentDays: List<DailyEarningsUiModel> = emptyList(),
     val rateLimitRemaining: Int = -1,
     val rateLimit: String = "",
     val lastUpdatedMillis: Long = 0L,
+    val nextRefreshAllowedMillis: Long = 0L,
     val error: String? = null
 )
 
@@ -91,6 +109,7 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         _uiState.value = _uiState.value.copy(
             configured = true,
             username = cleanUsername,
+            nextRefreshAllowedMillis = 0L,
             error = null
         )
         refresh(force = true)
@@ -108,6 +127,22 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         _uiState.value = _uiState.value.copy(autoRefresh = enabled)
     }
 
+    fun setSurfbarAlias(id: Long, alias: String) {
+        val cleanAlias = alias.trim()
+        val key = aliasKey(id)
+        if (cleanAlias.isBlank()) {
+            settings.edit().remove(key).apply()
+        } else {
+            settings.edit().putString(key, cleanAlias).apply()
+        }
+
+        _uiState.value = _uiState.value.copy(
+            surfbars = _uiState.value.surfbars.map { surfbar ->
+                if (surfbar.id == id) surfbar.copy(alias = cleanAlias) else surfbar
+            }
+        )
+    }
+
     fun refresh(force: Boolean = true) {
         if (_uiState.value.loading) return
 
@@ -121,11 +156,22 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
             return
         }
 
+        val now = System.currentTimeMillis()
+        val nextSafeRefresh = _uiState.value.nextRefreshAllowedMillis
+        if (nextSafeRefresh > now) {
+            if (force) {
+                _uiState.value = _uiState.value.copy(
+                    error = "API-Schutz aktiv: Nächste vollständige Aktualisierung in ${formatWait(nextSafeRefresh - now)}."
+                )
+            }
+            return
+        }
+
         val waitSeconds = EbesucherApi.secondsUntilFullRefreshAvailable()
         if (waitSeconds > 0L) {
             if (force) {
                 _uiState.value = _uiState.value.copy(
-                    error = "Nächste vollständige API-Prüfung in etwa $waitSeconds Sekunden möglich."
+                    error = "Lokaler API-Schutz: Noch etwa $waitSeconds Sekunden warten."
                 )
             }
             return
@@ -160,7 +206,8 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
             .take(MAX_SURFBARS)
 
         val calendar = Calendar.getInstance(BERLIN_TIME_ZONE, Locale.GERMANY)
-        val currentApiHour = calendar.get(Calendar.HOUR_OF_DAY) + 1
+        val currentApiHour = (calendar.get(Calendar.HOUR_OF_DAY) + 1).coerceIn(1, 24)
+        val completedApiHours = calendar.get(Calendar.HOUR_OF_DAY).coerceIn(0, 24)
         val previousApiHour = currentApiHour - 1
         val today = SimpleDateFormat("yyyy-MM-dd", Locale.GERMANY).apply {
             timeZone = BERLIN_TIME_ZONE
@@ -177,10 +224,12 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
             val current = hourly[currentApiHour] ?: 0.0
             val previous = if (previousApiHour >= 1) hourly[previousApiHour] ?: 0.0 else 0.0
             val total = hourly.values.sum()
+            val apiName = link.fullName.ifBlank { "Unbenannter Surflink" }
 
             SurfbarUiModel(
                 id = link.id,
-                name = link.fullName.ifBlank { "Unbenannter Surflink" },
+                apiName = apiName,
+                alias = settings.getString(aliasKey(link.id), "").orEmpty(),
                 url = link.url,
                 lastActivityMillis = link.lastActivityMillis,
                 todayBtp = total,
@@ -192,9 +241,39 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         }
 
         val totalToday = surfbarModels.sumOf { it.todayBtp }
+        val previousSnapshot = snapshotDatabase.latestTotalForToday()
+        val deltaSinceLastRefresh = previousSnapshot?.let { totalToday - it } ?: 0.0
         val currentHour = surfbarModels.sumOf { it.currentHourBtp }
         val previousHour = surfbarModels.sumOf { it.previousHourBtp }
         val earningCount = surfbarModels.count { it.todayBtp > BTP_EPSILON }
+
+        val completedValues = combinedHours.take(completedApiHours)
+        val completedTotal = completedValues.sumOf { it.toDouble() }
+        val elapsedForecast = if (completedApiHours > 0) {
+            completedTotal / completedApiHours.toDouble() * 24.0
+        } else {
+            totalToday
+        }
+        val forecast = maxOf(totalToday, elapsedForecast)
+
+        val positiveCompleted = completedValues.filter { it > BTP_EPSILON.toFloat() }
+        val averageEarningHour = if (positiveCompleted.isNotEmpty()) {
+            positiveCompleted.map { it.toDouble() }.average()
+        } else {
+            0.0
+        }
+
+        val bestCompletedIndex = completedValues.withIndex()
+            .maxByOrNull { it.value }
+            ?.takeIf { it.value > BTP_EPSILON.toFloat() }
+            ?.index ?: -1
+        val bestHour = if (bestCompletedIndex >= 0) completedValues[bestCompletedIndex].toDouble() else 0.0
+        val bestApiHour = if (bestCompletedIndex >= 0) bestCompletedIndex + 1 else 0
+
+        val visibleHours = combinedHours.take(currentApiHour)
+        val lastConfirmedIndex = visibleHours.indexOfLast { it > BTP_EPSILON.toFloat() }
+        val lastConfirmedHour = if (lastConfirmedIndex >= 0) visibleHours[lastConfirmedIndex].toDouble() else 0.0
+        val lastConfirmedApiHour = if (lastConfirmedIndex >= 0) lastConfirmedIndex + 1 else 0
 
         snapshotDatabase.insertSnapshot(
             totalBtp = totalToday,
@@ -202,20 +281,37 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
             surfbarCount = surfbarModels.size
         )
 
+        val recentDays = snapshotDatabase.getDailyMaxEarnings(7).map {
+            DailyEarningsUiModel(it.dayStartMillis, it.totalBtp)
+        }
+
+        val requestCount = 1 + rawLinks.size
+        val refreshInterval = calculateSafeRefreshInterval(api.rateLimit.orEmpty(), requestCount)
+        val updatedAt = System.currentTimeMillis()
+
         return DashboardUiState(
             configured = true,
             username = username,
             loading = false,
             connected = true,
             totalTodayBtp = totalToday,
+            deltaSinceLastRefresh = deltaSinceLastRefresh,
             currentHourBtp = currentHour,
             previousHourBtp = previousHour,
+            lastConfirmedHourBtp = lastConfirmedHour,
+            lastConfirmedApiHour = lastConfirmedApiHour,
+            forecastTodayBtp = forecast,
+            averageEarningHourBtp = averageEarningHour,
+            bestHourBtp = bestHour,
+            bestApiHour = bestApiHour,
             earningSurfbars = earningCount,
             surfbars = surfbarModels,
             combinedHourlyBtp = combinedHours,
+            recentDays = recentDays,
             rateLimitRemaining = api.rateLimitRemaining,
             rateLimit = api.rateLimit.orEmpty(),
-            lastUpdatedMillis = System.currentTimeMillis(),
+            lastUpdatedMillis = updatedAt,
+            nextRefreshAllowedMillis = updatedAt + refreshInterval,
             error = null
         )
     }
@@ -233,11 +329,32 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         return SurfStatus.NO_EARNINGS
     }
 
+    private fun calculateSafeRefreshInterval(limitHeader: String, requestCount: Int): Long {
+        val limit = Regex("\\d+").find(limitHeader)?.value?.toIntOrNull()
+            ?: return DEFAULT_AUTO_REFRESH_MS
+        if (limit <= 0) return DEFAULT_AUTO_REFRESH_MS
+
+        val refreshesPerHour = (limit / requestCount.coerceAtLeast(1)).coerceAtLeast(1)
+        return (ONE_HOUR_MS / refreshesPerHour).coerceAtLeast(MIN_AUTO_REFRESH_MS)
+    }
+
+    private fun formatWait(waitMillis: Long): String {
+        val totalSeconds = ((waitMillis + 999L) / 1000L).coerceAtLeast(1L)
+        val minutes = totalSeconds / 60L
+        val seconds = totalSeconds % 60L
+        return if (minutes > 0L) "$minutes Min ${seconds}s" else "$seconds s"
+    }
+
+    private fun aliasKey(id: Long): String = "surfbar_alias_$id"
+
     companion object {
         private const val SETTINGS_PREFS = "ebesucher_monitor_settings_v2"
         private const val KEY_AUTO_REFRESH = "auto_refresh"
         private const val MAX_SURFBARS = 4
         private const val BTP_EPSILON = 0.005
         private const val PENDING_WINDOW_MS = 60L * 60L * 1000L
+        private const val ONE_HOUR_MS = 60L * 60L * 1000L
+        private const val MIN_AUTO_REFRESH_MS = 2L * 60L * 1000L
+        private const val DEFAULT_AUTO_REFRESH_MS = 15L * 60L * 1000L
     }
 }
