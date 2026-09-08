@@ -19,9 +19,9 @@ import java.util.TimeZone
 private val BERLIN_TIME_ZONE: TimeZone = TimeZone.getTimeZone("Europe/Berlin")
 
 enum class SurfStatus {
-    ACTIVE,
-    WAITING,
-    INACTIVE
+    EARNINGS_CONFIRMED,
+    PENDING_CONFIRMATION,
+    NO_EARNINGS
 }
 
 data class SurfbarUiModel(
@@ -44,7 +44,8 @@ data class DashboardUiState(
     val autoRefresh: Boolean = true,
     val totalTodayBtp: Double = 0.0,
     val currentHourBtp: Double = 0.0,
-    val activeSurfbars: Int = 0,
+    val previousHourBtp: Double = 0.0,
+    val earningSurfbars: Int = 0,
     val surfbars: List<SurfbarUiModel> = emptyList(),
     val combinedHourlyBtp: List<Float> = List(24) { 0f },
     val rateLimitRemaining: Int = -1,
@@ -175,7 +176,7 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
 
             val current = hourly[currentApiHour] ?: 0.0
             val previous = if (previousApiHour >= 1) hourly[previousApiHour] ?: 0.0 else 0.0
-            val total = hourly.values.filterNotNull().sum()
+            val total = hourly.values.sum()
 
             SurfbarUiModel(
                 id = link.id,
@@ -186,17 +187,18 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
                 currentHourBtp = current,
                 previousHourBtp = previous,
                 hourlyBtp = values,
-                status = calculateStatus(link.lastActivityMillis, current, previous)
+                status = calculateStatus(total, link.lastActivityMillis)
             )
         }
 
         val totalToday = surfbarModels.sumOf { it.todayBtp }
         val currentHour = surfbarModels.sumOf { it.currentHourBtp }
-        val activeCount = surfbarModels.count { it.status == SurfStatus.ACTIVE }
+        val previousHour = surfbarModels.sumOf { it.previousHourBtp }
+        val earningCount = surfbarModels.count { it.todayBtp > BTP_EPSILON }
 
         snapshotDatabase.insertSnapshot(
             totalBtp = totalToday,
-            activeSurfbars = activeCount,
+            activeSurfbars = earningCount,
             surfbarCount = surfbarModels.size
         )
 
@@ -207,7 +209,8 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
             connected = true,
             totalTodayBtp = totalToday,
             currentHourBtp = currentHour,
-            activeSurfbars = activeCount,
+            previousHourBtp = previousHour,
+            earningSurfbars = earningCount,
             surfbars = surfbarModels,
             combinedHourlyBtp = combinedHours,
             rateLimitRemaining = api.rateLimitRemaining,
@@ -217,21 +220,17 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         )
     }
 
-    private fun calculateStatus(
-        lastActivityMillis: Long,
-        currentHourBtp: Double,
-        previousHourBtp: Double
-    ): SurfStatus {
-        if (currentHourBtp > BTP_EPSILON) return SurfStatus.ACTIVE
+    private fun calculateStatus(todayBtp: Double, lastActivityMillis: Long): SurfStatus {
+        if (todayBtp > BTP_EPSILON) return SurfStatus.EARNINGS_CONFIRMED
 
         if (lastActivityMillis > 0L) {
             val age = System.currentTimeMillis() - lastActivityMillis
-            if (age <= ACTIVE_WINDOW_MS) return SurfStatus.ACTIVE
-            if (age <= WAITING_WINDOW_MS) return SurfStatus.WAITING
+            if (age in 0..PENDING_WINDOW_MS) {
+                return SurfStatus.PENDING_CONFIRMATION
+            }
         }
 
-        if (previousHourBtp > BTP_EPSILON) return SurfStatus.WAITING
-        return SurfStatus.INACTIVE
+        return SurfStatus.NO_EARNINGS
     }
 
     companion object {
@@ -239,7 +238,6 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         private const val KEY_AUTO_REFRESH = "auto_refresh"
         private const val MAX_SURFBARS = 4
         private const val BTP_EPSILON = 0.005
-        private const val ACTIVE_WINDOW_MS = 5L * 60L * 1000L
-        private const val WAITING_WINDOW_MS = 15L * 60L * 1000L
+        private const val PENDING_WINDOW_MS = 60L * 60L * 1000L
     }
 }
