@@ -7,7 +7,7 @@ public final class SurflinkStats {
     public final String lastActivity;
     public final long lastActivityMillis;
     public double todayBtp;
-    public double last60MinutesBtp;
+    public double last10MinutesBtp;
 
     public SurflinkStats(long id, String fullName, String url, String lastActivity, long lastActivityMillis) {
         this.id = id;

@@ -39,12 +39,7 @@ public final class MainActivity extends Activity {
     private static final String PREF_AUTO = "auto_refresh";
     private static final String PREF_LAST_SUCCESS = "last_success";
 
-    private static final String PREF_EARN_DAY = "earn_day_";
-    private static final String PREF_EARN_TOTAL = "earn_total_";
-    private static final String PREF_LAST_GAIN = "last_gain_";
-
     private static final long REFRESH_INTERVAL_MS = 120_000L;
-    private static final long POSSIBLE_STALL_AFTER_MS = 15L * 60L * 1000L;
     private static final double BTP_EPSILON = 0.005;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -52,8 +47,7 @@ public final class MainActivity extends Activity {
     private final TextView[] surfName = new TextView[2];
     private final TextView[] surfStatus = new TextView[2];
     private final TextView[] surfToday = new TextView[2];
-    private final TextView[] surfDelta = new TextView[2];
-    private final TextView[] surfHour = new TextView[2];
+    private final TextView[] surfTenMinutes = new TextView[2];
     private final TextView[] surfLast = new TextView[2];
 
     private EditText usernameInput;
@@ -145,7 +139,7 @@ public final class MainActivity extends Activity {
         TextView title = text("eBesucher Monitor", 28, true, Color.rgb(17, 24, 39));
         root.addView(title);
 
-        TextView subtitle = text("Version 0.1.2 · Verdienst-basierter Status", 14, false,
+        TextView subtitle = text("Version 0.1.3 · 10-Minuten-BTP-Monitor", 14, false,
                 Color.rgb(75, 85, 99));
         subtitle.setPadding(0, dp(3), 0, dp(14));
         root.addView(subtitle);
@@ -213,9 +207,10 @@ public final class MainActivity extends Activity {
         root.addView(buildSurfbarCard(1), spacedParams());
 
         TextView note = text(
-                "Statuslogik v0.1.2: Entscheidend ist der BTP-Zuwachs zwischen zwei erfolgreichen "
-                        + "Prüfungen. lastActivity wird nur noch als API-Zusatzinfo angezeigt. "
-                        + "Kein Zuwachs bedeutet nicht automatisch, dass der Browser gestoppt ist.",
+                "Statuslogik v0.1.3: Grün bedeutet, dass eBesucher in den letzten 10 Minuten "
+                        + "BTP für diesen Surflink gemeldet hat. Orange bedeutet nur: derzeit keine "
+                        + "BTP-Gutschrift. Daraus folgt nicht automatisch, dass der Browser gestoppt ist. "
+                        + "lastActivity bleibt reine Zusatzinformation.",
                 12, false, Color.rgb(75, 85, 99));
         note.setPadding(dp(4), dp(2), dp(4), 0);
         root.addView(note);
@@ -230,22 +225,19 @@ public final class MainActivity extends Activity {
         surfName[index] = text("–", 20, true, Color.rgb(17, 24, 39));
         card.addView(surfName[index], topMargin(4));
 
-        surfStatus[index] = text("● Noch nicht beurteilbar", 15, true,
+        surfStatus[index] = text("● Noch keine Daten", 15, true,
                 Color.rgb(107, 114, 128));
         card.addView(surfStatus[index], topMargin(8));
 
         surfToday[index] = text("Heute: –", 18, true, Color.rgb(17, 24, 39));
         card.addView(surfToday[index], topMargin(10));
 
-        surfDelta[index] = text("Seit letzter Prüfung: –", 14, true,
+        surfTenMinutes[index] = text("Letzte 10 Minuten: –", 14, true,
                 Color.rgb(75, 85, 99));
-        card.addView(surfDelta[index], topMargin(4));
-
-        surfHour[index] = text("Letzte 60 Minuten: –", 14, false, Color.rgb(55, 65, 81));
-        card.addView(surfHour[index], topMargin(4));
+        card.addView(surfTenMinutes[index], topMargin(4));
 
         surfLast[index] = text("API lastActivity: –", 12, false, Color.rgb(107, 114, 128));
-        card.addView(surfLast[index], topMargin(4));
+        card.addView(surfLast[index], topMargin(5));
         return card;
     }
 
@@ -297,13 +289,14 @@ public final class MainActivity extends Activity {
                 int count = Math.min(2, links.size());
                 String today = berlinDate();
                 long nowUnix = System.currentTimeMillis() / 1000L;
-                long hourAgoUnix = nowUnix - 3600L;
+                long tenMinutesAgoUnix = nowUnix - 600L;
                 double total = 0.0;
 
                 for (int i = 0; i < count; i++) {
                     SurflinkStats item = links.get(i);
                     item.todayBtp = api.getHourlyEarnings(item.fullName, today);
-                    item.last60MinutesBtp = api.getEarnings(item.fullName, hourAgoUnix, nowUnix);
+                    item.last10MinutesBtp = api.getEarnings(
+                            item.fullName, tenMinutesAgoUnix, nowUnix);
                     total += item.todayBtp;
                 }
 
@@ -364,88 +357,22 @@ public final class MainActivity extends Activity {
     private void renderSurfbar(int index, SurflinkStats item) {
         surfName[index].setText(item.fullName.isEmpty() ? "Unbenannter Surflink" : item.fullName);
         surfToday[index].setText("Heute: " + btp(item.todayBtp));
-        surfHour[index].setText("Letzte 60 Minuten: " + btp(item.last60MinutesBtp));
+        surfTenMinutes[index].setText("Letzte 10 Minuten: " + btp(item.last10MinutesBtp));
 
-        EarningsState state = evaluateEarningsState(item);
-        surfStatus[index].setText(state.statusText);
-        surfStatus[index].setTextColor(state.statusColor);
-        surfDelta[index].setText(state.deltaText);
-        surfDelta[index].setTextColor(state.deltaColor);
+        if (item.last10MinutesBtp > BTP_EPSILON) {
+            surfStatus[index].setText("● BTP-GUTSCHRIFT AKTIV");
+            surfStatus[index].setTextColor(Color.rgb(21, 128, 61));
+            surfTenMinutes[index].setTextColor(Color.rgb(21, 128, 61));
+        } else {
+            surfStatus[index].setText("● DERZEIT KEINE BTP-GUTSCHRIFT");
+            surfStatus[index].setTextColor(Color.rgb(180, 83, 9));
+            surfTenMinutes[index].setText(
+                    "Letzte 10 Minuten: 0 BTP · Browser kann trotzdem Seiten laden");
+            surfTenMinutes[index].setTextColor(Color.rgb(180, 83, 9));
+        }
 
         surfLast[index].setText("API lastActivity: " + emptyDash(item.lastActivity)
                 + " · nur Zusatzinfo");
-    }
-
-    private EarningsState evaluateEarningsState(SurflinkStats item) {
-        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        String suffix = item.fullName == null ? "" : item.fullName;
-        String dayKey = PREF_EARN_DAY + suffix;
-        String totalKey = PREF_EARN_TOTAL + suffix;
-        String gainKey = PREF_LAST_GAIN + suffix;
-
-        String today = berlinDate();
-        String storedDay = prefs.getString(dayKey, "");
-        String previousText = prefs.getString(totalKey, null);
-        long now = System.currentTimeMillis();
-        long lastGain = prefs.getLong(gainKey, 0L);
-
-        boolean validPrevious = today.equals(storedDay) && previousText != null;
-        double previous = Double.NaN;
-        if (validPrevious) {
-            try {
-                previous = Double.parseDouble(previousText);
-            } catch (NumberFormatException ignored) {
-                validPrevious = false;
-            }
-        }
-
-        EarningsState state;
-        if (!validPrevious || Double.isNaN(previous)
-                || item.todayBtp + BTP_EPSILON < previous) {
-            lastGain = now;
-            state = new EarningsState(
-                    "● NOCH NICHT BEURTEILBAR",
-                    Color.rgb(107, 114, 128),
-                    "Seit letzter Prüfung: Baseline gespeichert",
-                    Color.rgb(75, 85, 99));
-        } else {
-            double delta = item.todayBtp - previous;
-            if (delta > BTP_EPSILON) {
-                lastGain = now;
-                state = new EarningsState(
-                        "● VERDIENT AKTUELL",
-                        Color.rgb(21, 128, 61),
-                        "Seit letzter Prüfung: +" + btp(delta),
-                        Color.rgb(21, 128, 61));
-            } else {
-                if (lastGain <= 0L) {
-                    lastGain = now;
-                }
-                long withoutGainMs = Math.max(0L, now - lastGain);
-                long minutes = withoutGainMs / 60_000L;
-                if (withoutGainMs >= POSSIBLE_STALL_AFTER_MS) {
-                    state = new EarningsState(
-                            "● MÖGLICHER STILLSTAND",
-                            Color.rgb(185, 28, 28),
-                            "Kein neuer Verdienst seit ca. " + minutes
-                                    + " Min · Browser kann trotzdem noch laufen",
-                            Color.rgb(185, 28, 28));
-                } else {
-                    state = new EarningsState(
-                            "● KEIN NEUER VERDIENST",
-                            Color.rgb(180, 83, 9),
-                            "Seit letzter Prüfung: +0 BTP · noch kein Offline-Nachweis",
-                            Color.rgb(180, 83, 9));
-                }
-            }
-        }
-
-        prefs.edit()
-                .putString(dayKey, today)
-                .putString(totalKey, Double.toString(item.todayBtp))
-                .putLong(gainKey, lastGain)
-                .apply();
-        return state;
     }
 
     private void clearSurfbar(int index) {
@@ -453,16 +380,14 @@ public final class MainActivity extends Activity {
         surfStatus[index].setText("● Keine Daten");
         surfStatus[index].setTextColor(Color.rgb(107, 114, 128));
         surfToday[index].setText("Heute: –");
-        surfDelta[index].setText("Seit letzter Prüfung: –");
-        surfDelta[index].setTextColor(Color.rgb(75, 85, 99));
-        surfHour[index].setText("Letzte 60 Minuten: –");
+        surfTenMinutes[index].setText("Letzte 10 Minuten: –");
+        surfTenMinutes[index].setTextColor(Color.rgb(75, 85, 99));
         surfLast[index].setText("API lastActivity: –");
     }
 
     private void renderError(String message) {
         connectionStatus.setText("✕ " + message);
         connectionStatus.setTextColor(Color.rgb(185, 28, 28));
-        // Wichtig: Die Zeit der letzten erfolgreichen Aktualisierung bleibt stehen.
         updateRefreshAvailability();
     }
 
@@ -584,19 +509,5 @@ public final class MainActivity extends Activity {
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
-    }
-
-    private static final class EarningsState {
-        final String statusText;
-        final int statusColor;
-        final String deltaText;
-        final int deltaColor;
-
-        EarningsState(String statusText, int statusColor, String deltaText, int deltaColor) {
-            this.statusText = statusText;
-            this.statusColor = statusColor;
-            this.deltaText = deltaText;
-            this.deltaColor = deltaColor;
-        }
     }
 }
