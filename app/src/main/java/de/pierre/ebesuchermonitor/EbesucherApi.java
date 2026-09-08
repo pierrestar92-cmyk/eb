@@ -31,12 +31,12 @@ public final class EbesucherApi {
     private static final String BASE_URL = "https://www.ebesucher.de/api/";
     private static final TimeZone BERLIN = TimeZone.getTimeZone("Europe/Berlin");
 
-    // Ein v0.1.4-Refresh benötigt 3 Requests: Surflinks + 2 Stundenstatistiken.
-    // Lokal bleiben maximal 5 Requests im rollenden Minutenfenster erlaubt.
+    // Ein v0.2.2-Komplettrefresh benötigt bei bis zu 4 Surflinks maximal 5 Requests.
+    // Zusätzlich schützt ein lokales Minutenfenster vor versehentlichen Request-Bursts.
     private static final Object LOCAL_RATE_LOCK = new Object();
     private static final ArrayDeque<Long> LOCAL_REQUESTS = new ArrayDeque<>();
     private static final int LOCAL_MAX_REQUESTS_PER_MINUTE = 5;
-    private static final int REQUESTS_PER_FULL_REFRESH = 3;
+    private static final int REQUESTS_PER_FULL_REFRESH = 5;
     private static final long LOCAL_RATE_WINDOW_MS = 60_000L;
 
     private final String authorization;
@@ -152,7 +152,7 @@ public final class EbesucherApi {
             connection.setUseCaches(false);
             connection.setRequestProperty("Accept", "application/json");
             connection.setRequestProperty("Authorization", authorization);
-            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1.4");
+            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.2.2");
 
             int status = connection.getResponseCode();
             updateRateLimit(connection);
@@ -172,7 +172,7 @@ public final class EbesucherApi {
                     throw new IOException("API-Limit erreicht. Bitte etwa "
                             + retryAfter.trim() + " Sekunden warten. Die letzten Daten bleiben sichtbar.");
                 }
-                throw new IOException("API-Limit erreicht. Bitte etwa 60 Sekunden warten. "
+                throw new IOException("API-Limit erreicht. Bitte später erneut versuchen. "
                         + "Die letzten Daten bleiben sichtbar.");
             }
             if (status < 200 || status >= 300) {
