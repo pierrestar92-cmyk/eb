@@ -17,6 +17,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.Iterator;
@@ -27,6 +28,13 @@ import java.util.TimeZone;
 public final class EbesucherApi {
     private static final String BASE_URL = "https://www.ebesucher.de/api/";
     private static final TimeZone BERLIN = TimeZone.getTimeZone("Europe/Berlin");
+
+    // eBesucher meldet derzeit 7 Requests/Minute. Der Client nutzt absichtlich
+    // nur 5 Requests pro rollender Minute und lässt 2 Requests Reserve.
+    private static final Object LOCAL_RATE_LOCK = new Object();
+    private static final ArrayDeque<Long> LOCAL_REQUESTS = new ArrayDeque<>();
+    private static final int LOCAL_MAX_REQUESTS_PER_MINUTE = 5;
+    private static final long LOCAL_RATE_WINDOW_MS = 60_000L;
 
     private final String authorization;
     private int rateLimitRemaining = -1;
@@ -90,6 +98,8 @@ public final class EbesucherApi {
     }
 
     private String get(String relativePath) throws IOException {
+        guardLocalRateLimit();
+
         HttpURLConnection connection = null;
         try {
             URL url = new URL(BASE_URL + relativePath);
@@ -100,7 +110,7 @@ public final class EbesucherApi {
             connection.setUseCaches(false);
             connection.setRequestProperty("Accept", "application/json");
             connection.setRequestProperty("Authorization", authorization);
-            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1");
+            connection.setRequestProperty("User-Agent", "eBesucher-Monitor-Android/0.1.1");
 
             int status = connection.getResponseCode();
             updateRateLimit(connection);
@@ -113,6 +123,15 @@ public final class EbesucherApi {
 
             if ("false".equalsIgnoreCase(authStatus)) {
                 throw new IOException("API-Anmeldung abgelehnt. Benutzername/API-Key prüfen.");
+            }
+            if (status == 429) {
+                String retryAfter = connection.getHeaderField("Retry-After");
+                if (retryAfter != null && !retryAfter.trim().isEmpty()) {
+                    throw new IOException("API-Limit erreicht. Bitte etwa "
+                            + retryAfter.trim() + " Sekunden warten. Die letzten Daten bleiben sichtbar.");
+                }
+                throw new IOException("API-Limit erreicht. Bitte etwa 60 Sekunden warten. "
+                        + "Die letzten Daten bleiben sichtbar.");
             }
             if (status < 200 || status >= 300) {
                 String detail = body == null ? "" : body.trim();
@@ -130,6 +149,26 @@ public final class EbesucherApi {
             if (connection != null) {
                 connection.disconnect();
             }
+        }
+    }
+
+    private static void guardLocalRateLimit() throws IOException {
+        synchronized (LOCAL_RATE_LOCK) {
+            long now = System.currentTimeMillis();
+            while (!LOCAL_REQUESTS.isEmpty()
+                    && now - LOCAL_REQUESTS.peekFirst() >= LOCAL_RATE_WINDOW_MS) {
+                LOCAL_REQUESTS.removeFirst();
+            }
+
+            if (LOCAL_REQUESTS.size() >= LOCAL_MAX_REQUESTS_PER_MINUTE) {
+                long oldest = LOCAL_REQUESTS.peekFirst();
+                long waitMs = Math.max(1L, LOCAL_RATE_WINDOW_MS - (now - oldest));
+                long waitSeconds = Math.max(1L, (waitMs + 999L) / 1000L);
+                throw new IOException("Rate-Limit-Schutz aktiv: Bitte noch " + waitSeconds
+                        + " Sekunden bis zur nächsten vollständigen Prüfung warten.");
+            }
+
+            LOCAL_REQUESTS.addLast(now);
         }
     }
 
